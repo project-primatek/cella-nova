@@ -15,10 +15,14 @@ Usage:
 
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# Enable MPS fallback for unsupported ops
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import esm
 import numpy as np
@@ -51,9 +55,10 @@ def encode_dna(sequence: str, max_length: int = 200) -> torch.Tensor:
 
 class DNAEncoder(nn.Module):
     """
-    DNA sequence encoder using CNN + Self-Attention
+    DNA sequence encoder using CNN + Bi-LSTM + Self-Attention
 
-    Captures both local motifs (via CNN) and long-range dependencies (via attention)
+    Captures local motifs (CNN), sequential dependencies (Bi-LSTM),
+    and long-range interactions (Self-Attention) - MPS compatible
     """
 
     def __init__(
@@ -69,6 +74,7 @@ class DNAEncoder(nn.Module):
         super().__init__()
 
         self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
         self.output_dim = output_dim
 
         # Nucleotide embedding
@@ -89,18 +95,24 @@ class DNAEncoder(nn.Module):
             nn.ReLU(),
         )
 
-        # Positional encoding
-        self.pos_encoding = nn.Parameter(torch.randn(1, 1000, hidden_dim) * 0.02)
+        # Bi-LSTM for sequential dependencies (MPS compatible)
+        self.lstm = nn.LSTM(
+            hidden_dim,
+            hidden_dim // 2,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0,
+        )
 
-        # Transformer encoder for capturing long-range dependencies
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
+        # Multi-head self-attention (MPS compatible - no mask needed)
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.attn_norm = nn.LayerNorm(hidden_dim)
 
         # Output projection
         self.projection = nn.Sequential(
@@ -136,21 +148,22 @@ class DNAEncoder(nn.Module):
         conv_out = self.conv_layers(conv_input)  # [batch, hidden_dim, seq_len]
         conv_out = conv_out.transpose(1, 2)  # [batch, seq_len, hidden_dim]
 
-        # Add positional encoding
-        conv_out = conv_out + self.pos_encoding[:, :seq_len, :]
+        # Bi-LSTM encoding
+        lstm_out, _ = self.lstm(conv_out)  # [batch, seq_len, hidden_dim]
 
-        # Transformer encoding
-        transformer_out = self.transformer(
-            conv_out, src_key_padding_mask=padding_mask
-        )  # [batch, seq_len, hidden_dim]
+        # Self-attention (without key_padding_mask for MPS compatibility)
+        # Instead, we zero out padded positions after attention
+        attn_out, _ = self.self_attention(lstm_out, lstm_out, lstm_out)
+        attn_out = self.attn_norm(lstm_out + attn_out)  # Residual connection
+
+        # Zero out padded positions
+        mask = (~padding_mask).float().unsqueeze(-1)  # [batch, seq_len, 1]
+        attn_out = attn_out * mask
 
         # Project to output dimension
-        sequence_output = self.projection(
-            transformer_out
-        )  # [batch, seq_len, output_dim]
+        sequence_output = self.projection(attn_out)  # [batch, seq_len, output_dim]
 
         # Pooled output (mean over non-padded positions)
-        mask = (~padding_mask).float().unsqueeze(-1)  # [batch, seq_len, 1]
         pooled_output = (sequence_output * mask).sum(dim=1) / mask.sum(dim=1).clamp(
             min=1
         )

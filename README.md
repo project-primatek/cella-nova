@@ -1,143 +1,159 @@
-# Protein-Protein Interaction Prediction
+# Cella Nova
 
-Predict protein-protein interactions using AlphaFold structures and machine learning.
+**Cella Nova** is a comprehensive cell modeling platform that uses deep learning to predict biomolecular interactions. The platform combines protein language models, graph neural networks, and attention mechanisms to model the complex interaction networks within cells.
 
-## Goal
+## Features
 
-Build a machine learning model that predicts whether two proteins interact, using:
-- **3D protein structures** from AlphaFold as input features
-- **Known interactions** from STRING database as training labels
+### Protein-Protein Interaction (PPI) Prediction
+Predict whether two proteins interact using:
+- **ESM-2 protein language model** for sequence embeddings
+- **Graph Neural Networks** for protein interaction network topology
+- **Structure encoding** via AlphaFold contact maps
+- **Siamese network architecture** for pairwise prediction
 
-## Datasets
+### Protein-DNA Interaction Prediction
+Predict transcription factor binding and protein-DNA interactions using:
+- **ESM-2** for protein sequence encoding
+- **CNN + Bi-LSTM + Attention** for DNA sequence encoding
+- **Cross-attention mechanism** for modeling protein-DNA interactions
+- **Binding affinity prediction** alongside binary classification
 
-### AlphaFold Database
-- Source: https://alphafold.ebi.ac.uk/
-- Contains: Predicted 3D structures for 200M+ proteins
-- Format: PDB files with atomic coordinates
-- Use: Extract structural features (surface properties, binding sites, shape)
+## Data Sources
 
-### STRING Database
-- Source: https://string-db.org/
-- Contains: Known and predicted protein-protein interactions
-- Format: Protein pairs with confidence scores (0-1000)
-- Use: Training labels (interacting vs non-interacting pairs)
+### Protein-Protein Interactions
+- **STRING Database**: Known and predicted protein-protein interactions with confidence scores
+- **AlphaFold Database**: Predicted 3D structures for structural feature extraction
 
-## Download Data
+### Protein-DNA Interactions
+- **JASPAR**: Transcription factor binding motifs
+- **UniProt**: DNA-binding protein sequences and annotations
+- **ENCODE**: ChIP-seq experimental binding data
 
-### 1. Download Proteome + AlphaFold Structures
+## Installation
 
 ```bash
-# Download all proteins and structures for a species
-python download_proteome.py --species "Mycoplasma genitalium"
+# Clone the repository
+git clone https://github.com/your-username/cella-nova.git
+cd cella-nova
 
-# For larger organisms, use more threads
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+## Usage
+
+### 1. Download Data
+
+```bash
+# Download proteome and AlphaFold structures
 python download_proteome.py --species "Homo sapiens" --threads 20
 
-# Or use UniProt proteome ID directly
-python download_proteome.py --uniprot-id UP000000807
+# Download STRING interactions
+python download_string.py --taxon-id 9606 --score 700
+
+# Download protein-DNA interaction data
+python download_pdna.py --species human
 ```
 
-Output:
-- `data/{species}/proteins.fasta` - All protein sequences
-- `data/{species}/structures/` - AlphaFold PDB files
-
-### 2. Download STRING Interactions
+### 2. Train Models
 
 ```bash
-# Download interactions for a species
-python download_string.py --species "Mycoplasma genitalium"
+# Train protein-protein interaction model
+python model_p2p.py --data-dir data/homo_sapiens --epochs 50
 
-# Filter by confidence score (700+ = high confidence)
-python download_string.py --taxon-id 9606 --score 700
+# Train protein-DNA interaction model
+python model_p2d.py --data-dir data/protein_dna --epochs 50
 ```
 
-Output:
-- `data/{species}/string/string_interactions.tsv` - Interaction pairs with scores
-
-## ML Approach
-
-### Data Preparation
-
-1. **Positive samples**: Protein pairs from STRING with high confidence scores (≥700)
-2. **Negative samples**: Random protein pairs not in STRING (or low confidence <150)
-3. **Train/test split**: 80/20, ensuring no protein leakage between sets
-
-### Feature Extraction (per protein)
-
-From AlphaFold PDB structures:
-- **Geometric**: Surface area, volume, radius of gyration
-- **Chemical**: Charge distribution, hydrophobicity patches
-- **Structural**: Secondary structure composition, exposed residues
-- **Sequence**: Amino acid frequencies, length
-
-For protein pairs:
-- Concatenate or compare individual features
-- Surface complementarity scores
-- Docking-based features (optional)
-
-### Model Architecture
-
-**Option 1: Classical ML**
-```
-Protein A features + Protein B features → Random Forest / XGBoost → Interaction probability
-```
-
-**Option 2: Graph Neural Network**
-```
-Protein A graph + Protein B graph → GNN encoder → Pair embedding → MLP → Interaction probability
-```
-
-Where each protein is a graph:
-- Nodes = amino acid residues
-- Edges = spatial contacts (Cα distance < 8Å)
-- Node features = residue properties
-
-### Training
+### 3. Make Predictions
 
 ```python
-# Pseudocode
-for protein_a, protein_b, label in dataloader:
-    feat_a = extract_features(protein_a)
-    feat_b = extract_features(protein_b)
-    pred = model(feat_a, feat_b)
-    loss = binary_cross_entropy(pred, label)
-    loss.backward()
+from model_p2p import PPIModel
+from model_p2d import ProteinDNAModel
+
+# Load trained models
+ppi_model = PPIModel.load("ppi_model.pt")
+p2d_model = ProteinDNAModel.load("pdna_model.pt")
+
+# Predict protein-protein interaction
+score = ppi_model.predict(protein_a_seq, protein_b_seq)
+
+# Predict protein-DNA binding
+binding_prob, affinity = p2d_model.predict(protein_seq, dna_seq)
 ```
 
-### Evaluation Metrics
-- AUROC, AUPRC (handles class imbalance)
-- Precision, Recall, F1 at various thresholds
+## Model Performance
 
-## Similar Projects
+### PPI Model
+| Metric | Score |
+|--------|-------|
+| AUC | 0.9999 |
+| Precision | 0.99 |
+| Recall | 1.00 |
+| F1 Score | 0.995 |
 
-### GitHub Repositories
-- [DeepPPI](https://github.com/hashemifar/DeepPPI) - CNN-based PPI prediction from sequence
-- [PIPR](https://github.com/muhaochen/seq_ppi) - Siamese RNN for PPI prediction
-- [GNN-PPI](https://github.com/lvguofeng/GNN_PPI) - Graph neural networks for PPI
-- [D-SCRIPT](https://github.com/samsledje/D-SCRIPT) - Structure-aware deep learning for PPI
-- [AlphaFold-Multimer](https://github.com/deepmind/alphafold) - Direct complex structure prediction
-
-### Key Papers
-- Jumper et al. (2021) - "Highly accurate protein structure prediction with AlphaFold" - *Nature*
-- Szklarczyk et al. (2023) - "The STRING database in 2023" - *Nucleic Acids Research*
-- Evans et al. (2022) - "Protein complex prediction with AlphaFold-Multimer" - *bioRxiv*
-- Sledzieski et al. (2021) - "D-SCRIPT: Predicting direct physical interactions" - *Cell Systems*
-- Gainza et al. (2020) - "Deciphering interaction fingerprints from protein molecular surfaces" - *Nature Methods*
+### Protein-DNA Model (3 epochs)
+| Metric | Score |
+|--------|-------|
+| AUC | 0.7087 |
+| F1 Score | 0.5745 |
+| Precision | 0.5870 |
+| Recall | 0.5625 |
 
 ## Project Structure
 
 ```
-p2p/
+cella-nova/
 ├── data/
 │   └── {species}/
 │       ├── proteins.fasta
 │       ├── sequences/
 │       ├── structures/
 │       └── string/
-├── download_proteome.py
-├── download_string.py
-└── requirements.txt
+├── download_proteome.py    # Download protein sequences and structures
+├── download_string.py      # Download STRING interaction data
+├── download_pdna.py        # Download protein-DNA interaction data
+├── model_p2p.py            # Protein-protein interaction model
+├── model_p2d.py            # Protein-DNA interaction model
+├── requirements.txt
+└── README.md
 ```
+
+## Architecture Overview
+
+### PPI Model
+```
+Protein A Sequence ──► ESM-2 Encoder ──┐
+                                       ├──► Cross-Modal Fusion ──► MLP ──► Interaction Score
+Protein B Sequence ──► ESM-2 Encoder ──┤
+                                       │
+Network Topology ────► GNN Encoder ────┘
+```
+
+### Protein-DNA Model
+```
+Protein Sequence ──► ESM-2 Encoder ──────────────┐
+                                                  ├──► Cross-Attention ──► MLP ──► Binding Prediction
+DNA Sequence ──► CNN ──► Bi-LSTM ──► Attention ──┘
+```
+
+## References
+
+### Databases
+- [STRING Database](https://string-db.org/) - Protein-protein interaction networks
+- [AlphaFold Database](https://alphafold.ebi.ac.uk/) - Protein structure predictions
+- [JASPAR](https://jaspar.genereg.net/) - Transcription factor binding profiles
+- [UniProt](https://www.uniprot.org/) - Protein sequence and annotation
+- [ENCODE](https://www.encodeproject.org/) - Encyclopedia of DNA Elements
+
+### Key Papers
+- Jumper et al. (2021) - "Highly accurate protein structure prediction with AlphaFold" - *Nature*
+- Lin et al. (2023) - "Evolutionary-scale prediction of atomic-level protein structure with a language model" - *Science*
+- Szklarczyk et al. (2023) - "The STRING database in 2023" - *Nucleic Acids Research*
 
 ## License
 
