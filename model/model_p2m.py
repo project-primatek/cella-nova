@@ -25,16 +25,14 @@ Data Sources:
 import argparse
 import json
 import os
-import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 # Enable MPS fallback for unsupported ops
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import esm
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -513,8 +511,10 @@ class ProteinMoleculeModel(nn.Module):
             nn.Linear(molecule_dim // 4, 1),
         )
 
-        # Fusion and prediction
+        # Projection layers for product and diff to match concat dimension
         fusion_dim = protein_dim + molecule_dim
+        self.product_projection = nn.Linear(protein_dim, fusion_dim)
+        self.diff_projection = nn.Linear(protein_dim, fusion_dim)
 
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim * 3, hidden_dim),  # concat, product, diff
@@ -600,11 +600,11 @@ class ProteinMoleculeModel(nn.Module):
         product = protein_pooled * molecule_pooled  # Element-wise interaction
         diff = torch.abs(protein_pooled - molecule_pooled)
 
-        # Adjust dimensions to match fusion input
-        product_expanded = torch.cat([product, torch.zeros_like(product)], dim=-1)
-        diff_expanded = torch.cat([diff, torch.zeros_like(diff)], dim=-1)
+        # Project product and diff to match concat dimension (learned projections, not zero padding)
+        product_projected = self.product_projection(product)
+        diff_projected = self.diff_projection(diff)
 
-        combined = torch.cat([concat, product_expanded, diff_expanded], dim=-1)
+        combined = torch.cat([concat, product_projected, diff_projected], dim=-1)
 
         # Fusion
         fused = self.fusion(combined)
@@ -624,77 +624,27 @@ class ProteinMoleculeModel(nn.Module):
 
 
 class ProteinMoleculeDataset(Dataset):
-    """Dataset for protein-small molecule interactions"""
+    """Dataset for protein-molecule interactions. Expects pre-processed data from prepare/ scripts."""
 
     def __init__(
         self,
         data_file: Path,
         max_protein_len: int = 1000,
         max_smiles_len: int = 150,
-        negative_ratio: float = 1.0,
-        seed: int = 42,
     ):
         self.max_protein_len = max_protein_len
         self.max_smiles_len = max_smiles_len
 
-        random.seed(seed)
-        np.random.seed(seed)
-
-        # Load data
-        print(f"Loading data from: {data_file}")
         self.samples = []
-        self.all_proteins = set()
-        self.all_molecules = set()
-        self.positive_pairs = []
-
         with open(data_file, "r") as f:
-            header = f.readline()
+            f.readline()  # Skip header
             for line in f:
                 parts = line.strip().split("\t")
-                if len(parts) >= 4:
-                    protein_id = parts[0]
-                    protein_seq = parts[1]
-                    smiles = parts[2]
-                    label = float(parts[3])
-
-                    # Get affinity if available
-                    affinity = float(parts[4]) if len(parts) > 4 else 0.0
-
-                    if len(protein_seq) >= 20 and len(smiles) >= 3:
-                        if label >= 0.5:  # Positive interaction
-                            self.positive_pairs.append((protein_seq, smiles))
-                            self.all_proteins.add(protein_seq)
-                            self.all_molecules.add(smiles)
-                            self.samples.append((protein_seq, smiles, 1.0, affinity))
-
-        print(f"  ✓ {len(self.positive_pairs):,} positive pairs")
-        print(f"  ✓ {len(self.all_proteins):,} unique proteins")
-        print(f"  ✓ {len(self.all_molecules):,} unique molecules")
-
-        # Generate negative pairs
-        self.protein_list = list(self.all_proteins)
-        self.molecule_list = list(self.all_molecules)
-        self.positive_set = set(self.positive_pairs)
-
-        num_neg = int(len(self.positive_pairs) * negative_ratio)
-        negative_count = 0
-
-        attempts = 0
-        while negative_count < num_neg and attempts < num_neg * 10:
-            protein = random.choice(self.protein_list)
-            molecule = random.choice(self.molecule_list)
-
-            if (protein, molecule) not in self.positive_set:
-                self.samples.append((protein, molecule, 0.0, 0.0))
-                self.positive_set.add((protein, molecule))
-                negative_count += 1
-
-            attempts += 1
-
-        print(f"  ✓ {negative_count:,} negative pairs")
-
-        random.shuffle(self.samples)
-        print(f"  ✓ {len(self.samples):,} total samples")
+                protein_seq = parts[1]
+                smiles = parts[2]
+                label = float(parts[3])
+                affinity = float(parts[4])
+                self.samples.append((protein_seq, smiles, label, affinity))
 
     def __len__(self):
         return len(self.samples)
@@ -739,8 +689,8 @@ def train_epoch(model, dataloader, optimizer, device, use_affinity=False):
         # Binary cross-entropy for interaction prediction
         loss = F.binary_cross_entropy_with_logits(output["interaction_logits"], labels)
 
-        # Add affinity loss for positive samples if available
-        if use_affinity and affinity.sum() > 0:
+        # Add affinity loss for positive samples (affinity data is always available now)
+        if use_affinity:
             mask = labels > 0.5
             if mask.sum() > 0:
                 affinity_loss = F.mse_loss(output["affinity"][mask], affinity[mask])

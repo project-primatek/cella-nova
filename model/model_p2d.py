@@ -16,16 +16,14 @@ Usage:
 import argparse
 import json
 import os
-import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 # Enable MPS fallback for unsupported ops
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import esm
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -349,8 +347,10 @@ class ProteinDNAModel(nn.Module):
             ]
         )
 
-        # Fusion and prediction
+        # Projection layers for product and diff to match concat dimension
         fusion_dim = protein_dim + dna_dim
+        self.product_projection = nn.Linear(protein_dim, fusion_dim)
+        self.diff_projection = nn.Linear(protein_dim, fusion_dim)
 
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim * 3, hidden_dim),  # concat, product, diff
@@ -408,14 +408,11 @@ class ProteinDNAModel(nn.Module):
         product = protein_pooled * dna_pooled  # Element-wise interaction
         diff = torch.abs(protein_pooled - dna_pooled)
 
-        # Note: product and diff use pooled (same dim), concat uses final
-        # Adjust dimensions to match
-        product_expanded = torch.cat(
-            [product, torch.zeros_like(product)], dim=-1
-        )  # Pad to fusion_dim
-        diff_expanded = torch.cat([diff, torch.zeros_like(diff)], dim=-1)
+        # Project product and diff to match concat dimension (learned projections, not zero padding)
+        product_projected = self.product_projection(product)
+        diff_projected = self.diff_projection(diff)
 
-        combined = torch.cat([concat, product_expanded, diff_expanded], dim=-1)
+        combined = torch.cat([concat, product_projected, diff_projected], dim=-1)
 
         # Fusion
         fused = self.fusion(combined)
@@ -428,77 +425,26 @@ class ProteinDNAModel(nn.Module):
 
 
 class ProteinDNADataset(Dataset):
-    """Dataset for protein-DNA interactions"""
+    """Dataset for protein-DNA interactions. Expects pre-processed data from prepare/ scripts."""
 
     def __init__(
         self,
         data_file: Path,
         max_protein_len: int = 1000,
         max_dna_len: int = 200,
-        negative_ratio: float = 1.0,
-        seed: int = 42,
     ):
         self.max_protein_len = max_protein_len
         self.max_dna_len = max_dna_len
 
-        random.seed(seed)
-        np.random.seed(seed)
-
-        # Load positive pairs
-        print(f"Loading data from: {data_file}")
-        self.positive_pairs = []
-        self.all_proteins = set()
-        self.all_dna = set()
-
+        self.samples = []
         with open(data_file, "r") as f:
-            header = f.readline()
+            f.readline()  # Skip header
             for line in f:
                 parts = line.strip().split("\t")
-                if len(parts) >= 4:
-                    protein_id = parts[0]
-                    protein_seq = parts[1]
-                    dna_seq = parts[2]
-                    label = int(parts[3])
-
-                    if label == 1 and len(protein_seq) >= 20 and len(dna_seq) >= 6:
-                        self.positive_pairs.append((protein_seq, dna_seq))
-                        self.all_proteins.add(protein_seq)
-                        self.all_dna.add(dna_seq)
-
-        print(f"  ✓ {len(self.positive_pairs):,} positive pairs")
-        print(f"  ✓ {len(self.all_proteins):,} unique proteins")
-        print(f"  ✓ {len(self.all_dna):,} unique DNA sequences")
-
-        # Generate negative pairs
-        self.protein_list = list(self.all_proteins)
-        self.dna_list = list(self.all_dna)
-        self.positive_set = set(self.positive_pairs)
-
-        num_neg = int(len(self.positive_pairs) * negative_ratio)
-        self.negative_pairs = []
-
-        attempts = 0
-        while len(self.negative_pairs) < num_neg and attempts < num_neg * 10:
-            protein = random.choice(self.protein_list)
-            dna = random.choice(self.dna_list)
-
-            if (protein, dna) not in self.positive_set:
-                self.negative_pairs.append((protein, dna))
-                self.positive_set.add((protein, dna))
-
-            attempts += 1
-
-        print(f"  ✓ {len(self.negative_pairs):,} negative pairs")
-
-        # Combine samples
-        self.samples = []
-        for protein, dna in self.positive_pairs:
-            self.samples.append((protein, dna, 1.0))
-        for protein, dna in self.negative_pairs:
-            self.samples.append((protein, dna, 0.0))
-
-        random.shuffle(self.samples)
-        print(f"  ✓ {len(self.samples):,} total samples")
+                protein_seq = parts[1]
+                dna_seq = parts[2]
+                label = float(parts[3])
+                self.samples.append((protein_seq, dna_seq, label))
 
     def __len__(self):
         return len(self.samples)

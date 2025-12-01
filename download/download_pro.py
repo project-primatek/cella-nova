@@ -58,6 +58,14 @@ STRING_API_URL = "https://string-db.org/api/json"
 STRING_DOWNLOAD_URL = "https://stringdb-downloads.org/download"
 STRING_VERSION = "12.0"
 
+# STRING uses species-level taxon IDs, not strain-specific ones
+# Map strain taxon IDs to STRING-compatible species taxon IDs
+STRING_TAXON_ID_MAP = {
+    559292: 4932,  # S. cerevisiae S288C -> S. cerevisiae (species)
+    83333: 511145,  # E. coli K12 -> E. coli K-12 MG1655 (STRING)
+    # Add more mappings as needed
+}
+
 # =============================================================================
 # FILTER DEFINITIONS
 # =============================================================================
@@ -244,111 +252,135 @@ def download_proteins(
 
     # First, get count
     count_params = {"query": query, "format": "json", "size": 1}
+    total_results = 0
 
-    try:
-        response = requests.get(UNIPROT_SEARCH_URL, params=count_params, timeout=30)
-        response.raise_for_status()
+    for attempt in range(3):
+        try:
+            response = requests.get(UNIPROT_SEARCH_URL, params=count_params, timeout=30)
+            response.raise_for_status()
 
-        # Get total from headers or response
-        total_results = int(response.headers.get("x-total-results", 0))
-        print(f"Found {total_results:,} proteins matching query")
-
-        if max_proteins:
-            total_results = min(total_results, max_proteins)
-            print(f"Limiting to {total_results:,} proteins")
-        print()
-
-    except requests.RequestException as e:
-        print(f"❌ Error querying UniProt: {e}")
-        return None
+            # Get total from headers
+            total_results = int(response.headers.get("x-total-results", 0))
+            if total_results > 0:
+                break
+        except requests.RequestException as e:
+            if attempt == 2:
+                print(f"❌ Error querying UniProt: {e}")
+                return None
+            time.sleep(1)
 
     if total_results == 0:
-        print("❌ No proteins found")
+        print("❌ No proteins found matching query")
         return None
 
-    # Download proteins in batches
+    print(f"Found {total_results:,} proteins matching query")
+
+    if max_proteins:
+        total_results = min(total_results, max_proteins)
+        print(f"Limiting to {total_results:,} proteins")
+    print()
+
+    # Download proteins using cursor-based pagination (UniProt REST API)
     proteins: Dict[str, Dict] = {}
     batch_size = 500
-    offset = 0
+    target_count = total_results
 
-    with tqdm(total=total_results, desc="Downloading proteins") as pbar:
-        while len(proteins) < total_results:
-            params = {
-                "query": query,
-                "format": "json",
-                "fields": ",".join(fields),
-                "size": min(batch_size, total_results - len(proteins)),
-                "offset": offset,
-            }
+    print(f"Starting download of {target_count:,} proteins...")
 
-            try:
-                response = requests.get(UNIPROT_SEARCH_URL, params=params, timeout=60)
-                response.raise_for_status()
-                data = response.json()
+    pbar = tqdm(
+        total=target_count,
+        desc="Downloading",
+        unit=" proteins",
+        dynamic_ncols=True,
+    )
 
-                results = data.get("results", [])
-                if not results:
-                    break
+    # Initial request URL
+    next_url = f"{UNIPROT_SEARCH_URL}?query={requests.utils.quote(query)}&format=json&fields={','.join(fields)}&size={batch_size}"
 
-                for entry in results:
-                    accession = entry.get("primaryAccession", "")
-                    if not accession:
-                        continue
+    while next_url:
+        try:
+            response = requests.get(next_url, timeout=60)
+            response.raise_for_status()
+            data = response.json()
 
-                    # Extract sequence
-                    sequence = entry.get("sequence", {}).get("value", "")
-                    if not sequence:
-                        continue
+            results = data.get("results", [])
+            if not results:
+                break
 
-                    # Extract gene name
-                    gene_name = ""
-                    genes = entry.get("genes", [])
-                    if genes:
-                        gene_name = genes[0].get("geneName", {}).get("value", "")
+            for entry in results:
+                accession = entry.get("primaryAccession", "")
+                if not accession:
+                    continue
 
-                    # Extract protein name
-                    protein_name = ""
-                    prot_desc = entry.get("proteinDescription", {})
-                    rec_name = prot_desc.get("recommendedName", {})
-                    if rec_name:
-                        protein_name = rec_name.get("fullName", {}).get("value", "")
+                # Extract sequence
+                sequence = entry.get("sequence", {}).get("value", "")
+                if not sequence:
+                    continue
 
-                    # Build protein entry
-                    proteins[accession] = {
-                        "accession": accession,
-                        "entry_name": entry.get("uniProtkbId", ""),
-                        "gene_name": gene_name,
-                        "protein_name": protein_name,
-                        "sequence": sequence,
-                        "length": len(sequence),
-                        "organism": entry.get("organism", {}).get("scientificName", ""),
-                        "taxon_id": entry.get("organism", {}).get("taxonId", taxon_id),
+                # Extract gene name
+                gene_name = ""
+                genes = entry.get("genes", [])
+                if genes:
+                    gene_name = genes[0].get("geneName", {}).get("value", "")
+
+                # Extract protein name
+                protein_name = ""
+                prot_desc = entry.get("proteinDescription", {})
+                rec_name = prot_desc.get("recommendedName", {})
+                if rec_name:
+                    protein_name = rec_name.get("fullName", {}).get("value", "")
+
+                # Build protein entry
+                proteins[accession] = {
+                    "accession": accession,
+                    "entry_name": entry.get("uniProtkbId", ""),
+                    "gene_name": gene_name,
+                    "protein_name": protein_name,
+                    "sequence": sequence,
+                    "length": len(sequence),
+                    "organism": entry.get("organism", {}).get("scientificName", ""),
+                    "taxon_id": entry.get("organism", {}).get("taxonId", taxon_id),
+                }
+
+                # Add features if requested
+                if include_features:
+                    proteins[accession]["keywords"] = [
+                        kw.get("name", "") for kw in entry.get("keywords", [])
+                    ]
+                    proteins[accession]["go_terms"] = {
+                        "process": entry.get("goTerms", {}).get("P", []),
+                        "function": entry.get("goTerms", {}).get("F", []),
+                        "component": entry.get("goTerms", {}).get("C", []),
                     }
 
-                    # Add features if requested
-                    if include_features:
-                        proteins[accession]["keywords"] = [
-                            kw.get("name", "") for kw in entry.get("keywords", [])
-                        ]
-                        proteins[accession]["go_terms"] = {
-                            "process": entry.get("goTerms", {}).get("P", []),
-                            "function": entry.get("goTerms", {}).get("F", []),
-                            "component": entry.get("goTerms", {}).get("C", []),
-                        }
+                if max_proteins and len(proteins) >= max_proteins:
+                    break
 
-                    pbar.update(1)
+            pbar.update(len(results))
 
-                    if max_proteins and len(proteins) >= max_proteins:
-                        break
+            # Check if we've hit max_proteins limit
+            if max_proteins and len(proteins) >= max_proteins:
+                break
 
-                offset += len(results)
-                time.sleep(0.1)  # Rate limiting
+            # Get next page URL from Link header (cursor-based pagination)
+            next_url = None
+            link_header = response.headers.get("Link", "")
+            if 'rel="next"' in link_header:
+                # Parse: <URL>; rel="next"
+                # Extract URL between < and >
+                start = link_header.find("<")
+                end = link_header.find(">")
+                if start != -1 and end != -1:
+                    next_url = link_header[start + 1 : end]
 
-            except requests.RequestException as e:
-                print(f"\n⚠️ Error at offset {offset}: {e}")
-                time.sleep(1)
-                continue
+            time.sleep(0.1)  # Rate limiting
 
+        except requests.RequestException as e:
+            print(f"\n⚠️ Error: {e}")
+            time.sleep(1)
+            continue
+
+    pbar.close()
     print(f"\n✓ Downloaded {len(proteins):,} proteins")
 
     # Save data
@@ -471,7 +503,7 @@ def download_alphafold_structure(uniprot_id: str, output_dir: Path) -> Tuple[str
     Returns:
         Tuple of (status, uniprot_id)
     """
-    url = f"{ALPHAFOLD_URL}/AF-{uniprot_id}-F1-model_v4.pdb"
+    url = f"{ALPHAFOLD_URL}/AF-{uniprot_id}-F1-model_v6.pdb"
     output_file = output_dir / f"{uniprot_id}.pdb"
 
     if output_file.exists():
@@ -583,7 +615,12 @@ def download_string_protein_info(
 
     import gzip
 
-    filename = f"{taxon_id}.protein.info.v{STRING_VERSION}.txt.gz"
+    # Map strain-specific taxon IDs to STRING-compatible species IDs
+    string_taxon_id = STRING_TAXON_ID_MAP.get(taxon_id, taxon_id)
+    if string_taxon_id != taxon_id:
+        print(f"  (mapped taxon {taxon_id} -> {string_taxon_id} for STRING)")
+
+    filename = f"{string_taxon_id}.protein.info.v{STRING_VERSION}.txt.gz"
     url = f"{STRING_DOWNLOAD_URL}/protein.info.v{STRING_VERSION}/{filename}"
 
     output_file_gz = output_dir / filename
@@ -639,7 +676,12 @@ def download_string_sequences(
 
     import gzip
 
-    filename = f"{taxon_id}.protein.sequences.v{STRING_VERSION}.fa.gz"
+    # Map strain-specific taxon IDs to STRING-compatible species IDs
+    string_taxon_id = STRING_TAXON_ID_MAP.get(taxon_id, taxon_id)
+    if string_taxon_id != taxon_id:
+        print(f"  (mapped taxon {taxon_id} -> {string_taxon_id} for STRING)")
+
+    filename = f"{string_taxon_id}.protein.sequences.v{STRING_VERSION}.fa.gz"
     url = f"{STRING_DOWNLOAD_URL}/protein.sequences.v{STRING_VERSION}/{filename}"
 
     output_file_gz = output_dir / filename
@@ -864,16 +906,9 @@ Available filters:
     )
 
     parser.add_argument(
-        "--reviewed-only",
-        action="store_true",
-        default=True,
-        help="Only download reviewed (Swiss-Prot) entries (default: True)",
-    )
-
-    parser.add_argument(
         "--include-unreviewed",
         action="store_true",
-        help="Include unreviewed (TrEMBL) entries",
+        help="Include unreviewed (TrEMBL) entries (default: only reviewed/Swiss-Prot)",
     )
 
     args = parser.parse_args()

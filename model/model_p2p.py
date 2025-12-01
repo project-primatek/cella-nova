@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 """
-Protein-Protein Interaction Prediction Model V2
-================================================
+Protein-Protein Interaction Prediction Model
+=============================================
 
 Multi-modal model combining:
 1. ESM-2 pretrained protein language model for sequence encoding
 2. AlphaFold structure encoding via contact maps
 3. Graph Neural Network for PPI network topology
 
-Uses existing proteome data from download_proteome.py and maps STRING IDs to UniProt IDs.
-
-Usage:
-    python model_v2.py --data-dir data/taxon_9606 --proteome-dir data/up000005640 --epochs 50
+Expects pre-processed data from prepare/ scripts.
 """
 
-import argparse
-import json
-import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import esm
 import numpy as np
@@ -28,7 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from Bio.PDB import PDBParser
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from torch_geometric.nn import SAGEConv
 from tqdm import tqdm
 
@@ -36,56 +30,6 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # Constants
 CONTACT_THRESHOLD = 8.0  # Angstroms for contact map
-
-
-class IDMapper:
-    """Map between STRING protein IDs and UniProt IDs using gene names"""
-
-    def __init__(self, string_info_file: Path, uniprot_fasta: Path):
-        self.string_to_gene = {}  # STRING ID -> gene name
-        self.gene_to_uniprot = {}  # gene name -> UniProt ID
-        self.string_to_uniprot = {}  # STRING ID -> UniProt ID (direct mapping)
-
-        # Load STRING protein info (STRING ID -> gene name)
-        if string_info_file.exists():
-            print(f"Loading STRING protein info...")
-            with open(string_info_file, "r") as f:
-                f.readline()  # Skip header
-                for line in f:
-                    parts = line.strip().split("\t")
-                    if len(parts) >= 2:
-                        string_id = parts[0]
-                        gene_name = parts[1].upper()
-                        self.string_to_gene[string_id] = gene_name
-
-        # Load UniProt FASTA (gene name -> UniProt ID)
-        if uniprot_fasta.exists():
-            print(f"Loading UniProt gene mappings...")
-            with open(uniprot_fasta, "r") as f:
-                for line in f:
-                    if line.startswith(">"):
-                        # Parse: >tr|A0A087WVL8|A0A087WVL8_HUMAN ... GN=FMR1 ...
-                        parts = line.split("|")
-                        if len(parts) >= 2:
-                            uniprot_id = parts[1]
-                            # Extract gene name
-                            if "GN=" in line:
-                                gn_start = line.index("GN=") + 3
-                                gn_end = line.find(" ", gn_start)
-                                if gn_end == -1:
-                                    gn_end = len(line)
-                                gene_name = line[gn_start:gn_end].strip().upper()
-                                self.gene_to_uniprot[gene_name] = uniprot_id
-
-        # Build STRING -> UniProt mapping
-        for string_id, gene_name in self.string_to_gene.items():
-            if gene_name in self.gene_to_uniprot:
-                self.string_to_uniprot[string_id] = self.gene_to_uniprot[gene_name]
-
-        print(f"  ✓ Mapped {len(self.string_to_uniprot):,} STRING IDs to UniProt IDs")
-
-    def get_uniprot_id(self, string_id: str) -> Optional[str]:
-        return self.string_to_uniprot.get(string_id)
 
 
 class StructureParser:
@@ -96,41 +40,43 @@ class StructureParser:
         self.parser = PDBParser(QUIET=True)
         self.cache = {}
 
-    def parse_pdb(self, pdb_path: Path) -> Optional[Dict]:
+    def parse_pdb(self, pdb_path: Path) -> Dict:
         """Parse PDB file and extract structural features"""
         if str(pdb_path) in self.cache:
             return self.cache[str(pdb_path)]
 
-        try:
-            structure = self.parser.get_structure("protein", str(pdb_path))
-            model = structure[0]
-            chains = list(model.get_chains())
-            if not chains:
-                return None
+        if not pdb_path.exists():
+            raise FileNotFoundError(f"Structure file not found: {pdb_path}")
 
-            chain = chains[0]
-            ca_coords = []
+        structure = self.parser.get_structure("protein", str(pdb_path))
+        model = structure[0]
+        chains = list(model.get_chains())
+        if not chains:
+            raise ValueError(f"No chains found in structure: {pdb_path}")
 
-            for residue in chain.get_residues():
-                if residue.id[0] != " " or "CA" not in residue:
-                    continue
-                ca_coords.append(residue["CA"].get_coord())
+        chain = chains[0]
+        ca_coords = []
 
-            if len(ca_coords) < 10:
-                return None
+        for residue in chain.get_residues():
+            if residue.id[0] != " " or "CA" not in residue:
+                continue
+            ca_coords.append(residue["CA"].get_coord())
 
-            ca_coords = np.array(ca_coords, dtype=np.float32)
+        if len(ca_coords) < 10:
+            raise ValueError(
+                f"Too few CA atoms ({len(ca_coords)}) in structure: {pdb_path}"
+            )
 
-            # Compute distance matrix and contact map
-            diff = ca_coords[:, None, :] - ca_coords[None, :, :]
-            distances = np.sqrt(np.sum(diff**2, axis=-1))
-            contact_map = (distances < self.contact_threshold).astype(np.float32)
+        ca_coords = np.array(ca_coords, dtype=np.float32)
 
-            result = {"contact_map": contact_map, "length": len(ca_coords)}
-            self.cache[str(pdb_path)] = result
-            return result
-        except Exception:
-            return None
+        # Compute distance matrix and contact map
+        diff = ca_coords[:, None, :] - ca_coords[None, :, :]
+        distances = np.sqrt(np.sum(diff**2, axis=-1))
+        contact_map = (distances < self.contact_threshold).astype(np.float32)
+
+        result = {"contact_map": contact_map, "length": len(ca_coords)}
+        self.cache[str(pdb_path)] = result
+        return result
 
     def get_contact_tensor(
         self, contact_map: np.ndarray, max_length: int = 500
@@ -285,6 +231,59 @@ class GNNEncoder(nn.Module):
         return x
 
 
+class PPIGraph:
+    """
+    Protein-protein interaction graph for GNN encoding.
+    Expects pre-processed data from prepare/ scripts.
+    """
+
+    def __init__(
+        self,
+        protein_ids: List[str],
+        edge_index: torch.Tensor,
+        sequences: Dict[str, str],
+        device: torch.device,
+    ):
+        self.device = device
+        self.sequences = sequences
+
+        self.uniprot_to_idx = {uid: idx for idx, uid in enumerate(protein_ids)}
+        self.idx_to_uniprot = {idx: uid for idx, uid in enumerate(protein_ids)}
+        self.num_proteins = len(protein_ids)
+
+        self.edge_index = edge_index.to(device)
+        self.gnn_embeddings: Optional[torch.Tensor] = None
+
+    def compute_gnn_embeddings(
+        self,
+        gnn_encoder: nn.Module,
+        sequence_encoder: nn.Module,
+        batch_size: int = 32,
+    ) -> None:
+        """Pre-compute GNN embeddings for all proteins"""
+        all_embeddings = []
+        protein_ids = [self.idx_to_uniprot[i] for i in range(self.num_proteins)]
+
+        with torch.no_grad():
+            for i in range(0, len(protein_ids), batch_size):
+                batch_ids = protein_ids[i : i + batch_size]
+                batch_seqs = [self.sequences[uid] for uid in batch_ids]
+                embeddings = sequence_encoder(batch_seqs)
+                all_embeddings.append(embeddings.cpu())
+
+        node_features = torch.cat(all_embeddings, dim=0).to(self.device)
+
+        gnn_encoder.eval()
+        with torch.no_grad():
+            self.gnn_embeddings = gnn_encoder(node_features, self.edge_index)
+        gnn_encoder.train()
+
+    def get_embeddings(self, uniprot_ids: List[str]) -> torch.Tensor:
+        """Get pre-computed GNN embeddings for a list of proteins"""
+        indices = [self.uniprot_to_idx[uid] for uid in uniprot_ids]
+        return self.gnn_embeddings[indices]
+
+
 class PPIModel(nn.Module):
     """
     Multi-modal Protein-Protein Interaction Predictor
@@ -345,26 +344,21 @@ class PPIModel(nn.Module):
     def encode_proteins(
         self,
         sequences: List[str],
-        contact_maps: torch.Tensor = None,
-        gnn_embeddings: torch.Tensor = None,
+        contact_maps: torch.Tensor,
+        gnn_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode proteins using all modalities"""
-        batch_size = len(sequences)
+        """Encode proteins using all modalities
 
+        All inputs are required - no fallback to zeros.
+        """
         # Sequence encoding (ESM-2)
         seq_emb = self.sequence_encoder(sequences)
 
         # Structure encoding
-        if contact_maps is not None:
-            struct_emb = self.structure_encoder(contact_maps.to(self.device))
-        else:
-            struct_emb = torch.zeros(batch_size, self.protein_dim, device=self.device)
+        struct_emb = self.structure_encoder(contact_maps.to(self.device))
 
         # GNN encoding (pre-computed node embeddings)
-        if gnn_embeddings is not None:
-            gnn_emb = gnn_embeddings.to(self.device)
-        else:
-            gnn_emb = torch.zeros(batch_size, self.protein_dim, device=self.device)
+        gnn_emb = gnn_embeddings.to(self.device)
 
         # Concatenate all modalities
         combined = torch.cat([seq_emb, struct_emb, gnn_emb], dim=-1)
@@ -374,12 +368,15 @@ class PPIModel(nn.Module):
         self,
         seq1: List[str],
         seq2: List[str],
-        contact1: torch.Tensor = None,
-        contact2: torch.Tensor = None,
-        gnn_emb1: torch.Tensor = None,
-        gnn_emb2: torch.Tensor = None,
+        contact1: torch.Tensor,
+        contact2: torch.Tensor,
+        gnn_emb1: torch.Tensor,
+        gnn_emb2: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict protein-protein interaction"""
+        """Predict protein-protein interaction
+
+        All inputs are required - no fallback to zeros.
+        """
         # Encode both proteins
         emb1 = self.encode_proteins(seq1, contact1, gnn_emb1)
         emb2 = self.encode_proteins(seq2, contact2, gnn_emb2)
@@ -399,94 +396,32 @@ class PPIModel(nn.Module):
 
 
 class PPIDataset(Dataset):
-    """Dataset for protein-protein interactions"""
+    """Dataset for protein-protein interactions. Expects pre-processed data from prepare/ scripts."""
 
     def __init__(
         self,
-        interactions: List[Tuple],
+        data_file: Path,
         sequences: Dict[str, str],
         structures_dir: Path,
-        id_mapper: IDMapper,
+        ppi_graph: PPIGraph,
         max_struct_length: int = 500,
-        negative_ratio: float = 1.0,
-        seed: int = 42,
     ):
         self.sequences = sequences
         self.structures_dir = structures_dir
-        self.id_mapper = id_mapper
+        self.ppi_graph = ppi_graph
         self.max_struct_length = max_struct_length
         self.structure_parser = StructureParser()
 
-        random.seed(seed)
-        np.random.seed(seed)
-
-        # Filter to proteins with sequences (via UniProt mapping)
-        print("Building dataset...")
-        self.positive_pairs = []
-        self.scores = []
-
-        for p1, p2, score in interactions:
-            uniprot1 = id_mapper.get_uniprot_id(p1)
-            uniprot2 = id_mapper.get_uniprot_id(p2)
-            if (
-                uniprot1
-                and uniprot2
-                and uniprot1 in sequences
-                and uniprot2 in sequences
-            ):
-                self.positive_pairs.append((p1, p2, uniprot1, uniprot2))
-                self.scores.append(score / 1000.0)
-
-        print(f"  ✓ {len(self.positive_pairs):,} positive pairs with sequences")
-
-        # Count pairs with structures
-        struct_count = 0
-        for _, _, u1, u2 in self.positive_pairs:
-            if (self.structures_dir / f"{u1}.pdb").exists() and (
-                self.structures_dir / f"{u2}.pdb"
-            ).exists():
-                struct_count += 1
-        print(f"  ✓ {struct_count:,} pairs with both structures")
-
-        # Track positive pairs for negative sampling
-        self.positive_set = set()
-        for p1, p2, _, _ in self.positive_pairs:
-            self.positive_set.add((p1, p2))
-            self.positive_set.add((p2, p1))
-
-        # Get all STRING IDs that have UniProt mappings
-        self.protein_list = list(
-            set(p for p1, p2, _, _ in self.positive_pairs for p in [p1, p2])
-        )
-
-        # Generate negative pairs
-        num_neg = int(len(self.positive_pairs) * negative_ratio)
-        self.negative_pairs = []
-        attempts = 0
-
-        while len(self.negative_pairs) < num_neg and attempts < num_neg * 10:
-            p1 = random.choice(self.protein_list)
-            p2 = random.choice(self.protein_list)
-            if p1 != p2 and (p1, p2) not in self.positive_set:
-                u1 = id_mapper.get_uniprot_id(p1)
-                u2 = id_mapper.get_uniprot_id(p2)
-                if u1 and u2:
-                    self.negative_pairs.append((p1, p2, u1, u2))
-                    self.positive_set.add((p1, p2))
-                    self.positive_set.add((p2, p1))
-            attempts += 1
-
-        print(f"  ✓ {len(self.negative_pairs):,} negative pairs")
-
-        # Combine samples
         self.samples = []
-        for (p1, p2, u1, u2), score in zip(self.positive_pairs, self.scores):
-            self.samples.append((u1, u2, 1.0, score))
-        for p1, p2, u1, u2 in self.negative_pairs:
-            self.samples.append((u1, u2, 0.0, 0.0))
-
-        random.shuffle(self.samples)
-        print(f"  ✓ {len(self.samples):,} total samples")
+        with open(data_file, "r") as f:
+            f.readline()  # Skip header
+            for line in f:
+                parts = line.strip().split("\t")
+                u1 = parts[0]
+                u2 = parts[1]
+                label = float(parts[2])
+                score = float(parts[3])
+                self.samples.append((u1, u2, label, score))
 
     def __len__(self):
         return len(self.samples)
@@ -494,134 +429,71 @@ class PPIDataset(Dataset):
     def __getitem__(self, idx):
         u1, u2, label, score = self.samples[idx]
 
-        result = {
+        pdb1 = self.structures_dir / f"{u1}.pdb"
+        pdb2 = self.structures_dir / f"{u2}.pdb"
+
+        parsed1 = self.structure_parser.parse_pdb(pdb1)
+        parsed2 = self.structure_parser.parse_pdb(pdb2)
+
+        return {
             "uniprot1": u1,
             "uniprot2": u2,
             "seq1": self.sequences[u1],
             "seq2": self.sequences[u2],
             "label": torch.tensor(label, dtype=torch.float32),
             "score": torch.tensor(score, dtype=torch.float32),
+            "contact1": self.structure_parser.get_contact_tensor(
+                parsed1["contact_map"], self.max_struct_length
+            ),
+            "contact2": self.structure_parser.get_contact_tensor(
+                parsed2["contact_map"], self.max_struct_length
+            ),
         }
 
-        # Load structure features
-        pdb1 = self.structures_dir / f"{u1}.pdb"
-        pdb2 = self.structures_dir / f"{u2}.pdb"
 
-        if pdb1.exists():
-            parsed = self.structure_parser.parse_pdb(pdb1)
-            if parsed:
-                result["contact1"] = self.structure_parser.get_contact_tensor(
-                    parsed["contact_map"], self.max_struct_length
-                )
-            else:
-                result["contact1"] = torch.zeros(
-                    self.max_struct_length, self.max_struct_length
-                )
-        else:
-            result["contact1"] = torch.zeros(
-                self.max_struct_length, self.max_struct_length
-            )
-
-        if pdb2.exists():
-            parsed = self.structure_parser.parse_pdb(pdb2)
-            if parsed:
-                result["contact2"] = self.structure_parser.get_contact_tensor(
-                    parsed["contact_map"], self.max_struct_length
-                )
-            else:
-                result["contact2"] = torch.zeros(
-                    self.max_struct_length, self.max_struct_length
-                )
-        else:
-            result["contact2"] = torch.zeros(
-                self.max_struct_length, self.max_struct_length
-            )
-
-        return result
-
-
-def collate_fn(batch):
+def collate_fn(batch, ppi_graph: PPIGraph):
     """Collate function for DataLoader"""
+    uniprot1_list = [b["uniprot1"] for b in batch]
+    uniprot2_list = [b["uniprot2"] for b in batch]
+
     return {
-        "uniprot1": [b["uniprot1"] for b in batch],
-        "uniprot2": [b["uniprot2"] for b in batch],
         "seq1": [b["seq1"] for b in batch],
         "seq2": [b["seq2"] for b in batch],
         "contact1": torch.stack([b["contact1"] for b in batch]),
         "contact2": torch.stack([b["contact2"] for b in batch]),
+        "gnn_emb1": ppi_graph.get_embeddings(uniprot1_list),
+        "gnn_emb2": ppi_graph.get_embeddings(uniprot2_list),
         "label": torch.stack([b["label"] for b in batch]),
         "score": torch.stack([b["score"] for b in batch]),
     }
 
 
-class DataManager:
-    """Manage data loading for STRING + UniProt proteome"""
+def load_sequences(fasta_file: Path) -> Dict[str, str]:
+    """Load protein sequences from FASTA file"""
+    sequences = {}
+    current_id = None
+    current_seq = []
 
-    def __init__(self, string_dir: Path, proteome_dir: Path):
-        self.string_dir = Path(string_dir)
-        self.proteome_dir = Path(proteome_dir)
-        self.structures_dir = self.proteome_dir / "structures"
+    with open(fasta_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if current_id:
+                    sequences[current_id] = "".join(current_seq)
+                current_id = line[1:].split()[0]
+                current_seq = []
+            else:
+                current_seq.append(line)
+        if current_id:
+            sequences[current_id] = "".join(current_seq)
 
-        # Create ID mapper
-        string_info = self.string_dir / "string" / "string_protein_info.tsv"
-        uniprot_fasta = self.proteome_dir / "proteins.fasta"
-        self.id_mapper = IDMapper(string_info, uniprot_fasta)
+    return sequences
 
-    def load_interactions(self, min_score: int = 0, max_count: int = None) -> List:
-        """Load protein interactions from STRING"""
-        interactions_file = self.string_dir / "string" / "string_interactions.tsv"
-        if not interactions_file.exists():
-            raise FileNotFoundError(f"Not found: {interactions_file}")
 
-        print(f"Loading interactions from: {interactions_file}")
-
-        interactions = []
-        with open(interactions_file, "r") as f:
-            f.readline()  # Skip header
-            for line in f:
-                if max_count and len(interactions) >= max_count:
-                    break
-                parts = line.strip().split()
-                if len(parts) >= 3:
-                    p1, p2, score = parts[0], parts[1], int(parts[2])
-                    if score >= min_score:
-                        interactions.append((p1, p2, score))
-
-        print(f"  ✓ Loaded {len(interactions):,} interactions")
-        return interactions
-
-    def load_sequences(self) -> Dict[str, str]:
-        """Load protein sequences from UniProt proteome"""
-        fasta_file = self.proteome_dir / "proteins.fasta"
-        if not fasta_file.exists():
-            raise FileNotFoundError(f"Not found: {fasta_file}")
-
-        print(f"Loading sequences from: {fasta_file}")
-
-        sequences = {}
-        current_id = None
-        current_seq = []
-
-        with open(fasta_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith(">"):
-                    if current_id:
-                        sequences[current_id] = "".join(current_seq)
-                    # Parse UniProt ID from header: >tr|A0A087WVL8|...
-                    parts = line.split("|")
-                    if len(parts) >= 2:
-                        current_id = parts[1]
-                    else:
-                        current_id = line[1:].split()[0]
-                    current_seq = []
-                else:
-                    current_seq.append(line)
-            if current_id:
-                sequences[current_id] = "".join(current_seq)
-
-        print(f"  ✓ Loaded {len(sequences):,} sequences")
-        return sequences
+def load_graph(graph_file: Path) -> Tuple[List[str], torch.Tensor]:
+    """Load pre-processed graph from file"""
+    data = torch.load(graph_file)
+    return data["protein_ids"], data["edge_index"]
 
 
 def train_epoch(model, dataloader, optimizer, device):
@@ -642,6 +514,8 @@ def train_epoch(model, dataloader, optimizer, device):
             seq2=batch["seq2"],
             contact1=batch["contact1"],
             contact2=batch["contact2"],
+            gnn_emb1=batch["gnn_emb1"],
+            gnn_emb2=batch["gnn_emb2"],
         )
 
         # Combined loss
@@ -681,6 +555,8 @@ def evaluate(model, dataloader, device):
                 seq2=batch["seq2"],
                 contact1=batch["contact1"],
                 contact2=batch["contact2"],
+                gnn_emb1=batch["gnn_emb1"],
+                gnn_emb2=batch["gnn_emb2"],
             )
 
             loss = F.binary_cross_entropy_with_logits(logits, labels)
@@ -775,163 +651,5 @@ def train_model(
 
     print("\n" + "=" * 70)
     print(f"Training complete. Best AUC: {best_auc:.4f}")
-    print("=" * 70)
 
     return history
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Train PPI Prediction Model V2")
-    parser.add_argument(
-        "--string-dir",
-        type=str,
-        required=True,
-        help="Directory containing STRING data (e.g., data/taxon_9606)",
-    )
-    parser.add_argument(
-        "--proteome-dir",
-        type=str,
-        required=True,
-        help="Directory containing UniProt proteome (e.g., data/up000005640)",
-    )
-    parser.add_argument("--checkpoint", type=str, default="ppi_model_v2.pt")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--min-score", type=int, default=0)
-    parser.add_argument("--max-interactions", type=int, default=None)
-    parser.add_argument("--val-split", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--esm-model",
-        type=str,
-        default="esm2_t12_35M_UR50D",
-        help="ESM model: esm2_t6_8M_UR50D, esm2_t12_35M_UR50D, esm2_t30_150M_UR50D",
-    )
-
-    args = parser.parse_args()
-
-    # Set seeds
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    # Set device
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
-    print("=" * 70)
-    print("PROTEIN-PROTEIN INTERACTION PREDICTION MODEL V2")
-    print("=" * 70)
-    print(f"\nSTRING data: {args.string_dir}")
-    print(f"Proteome: {args.proteome_dir}")
-    print(f"Device: {device}")
-    print(f"ESM Model: {args.esm_model}")
-    print(f"Epochs: {args.epochs}")
-    print(f"Batch Size: {args.batch_size}")
-    print()
-
-    # Load data
-    dm = DataManager(Path(args.string_dir), Path(args.proteome_dir))
-
-    # Load interactions
-    interactions = dm.load_interactions(
-        min_score=args.min_score, max_count=args.max_interactions
-    )
-
-    # Load sequences
-    sequences = dm.load_sequences()
-    if not sequences:
-        print("❌ No sequences available")
-        return
-
-    print()
-    print("=" * 70)
-    print("CREATING DATASET")
-    print("=" * 70)
-
-    dataset = PPIDataset(
-        interactions=interactions,
-        sequences=sequences,
-        structures_dir=dm.structures_dir,
-        id_mapper=dm.id_mapper,
-        negative_ratio=1.0,
-        seed=args.seed,
-    )
-
-    if len(dataset) == 0:
-        print("❌ No valid samples in dataset")
-        return
-
-    # Split dataset
-    val_size = int(len(dataset) * args.val_split)
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
-
-    print(f"\nTrain: {len(train_dataset):,} | Val: {len(val_dataset):,}")
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
-
-    # Create model
-    print()
-    print("=" * 70)
-    print("MODEL")
-    print("=" * 70)
-
-    model = PPIModel(
-        protein_dim=512,
-        hidden_dim=512,
-        esm_model=args.esm_model,
-        gnn_layers=3,
-        dropout=0.1,
-        device=device,
-    ).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-
-    # Train
-    save_path = Path(args.checkpoint)
-    history = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=args.epochs,
-        lr=args.lr,
-        device=device,
-        save_path=save_path,
-        patience=10,
-    )
-
-    # Save history
-    with open(save_path.with_suffix(".history.json"), "w") as f:
-        json.dump(history, f, indent=2)
-
-    print("\nDone!")
-
-
-if __name__ == "__main__":
-    main()
